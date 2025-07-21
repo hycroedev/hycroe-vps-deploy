@@ -74,7 +74,8 @@ def get_user_servers(user):
     servers = []
     with open(database_file, 'r') as f:
         for line in f:
-            if line.startswith(user):
+            parts = line.strip().split('|')
+            if len(parts) >= 3 and parts[0] == user:
                 servers.append(line.strip())
     return servers
 
@@ -86,8 +87,9 @@ def get_container_id_from_database(user, container_name):
         return None
     with open(database_file, 'r') as f:
         for line in f:
-            if line.startswith(user) and container_name in line:
-                return line.split('|')[1]
+            parts = line.strip().split('|')
+            if len(parts) >= 3 and parts[0] == user and container_name in parts[1]:
+                return parts[1]
     return None
 
 def get_system_resources():
@@ -319,6 +321,7 @@ async def start_server(interaction: discord.Interaction, container_id: str):
     try:
         user = str(interaction.user)
         container_info = None
+        ssh_command = None
         
         if not os.path.exists(database_file):
             embed = discord.Embed(  
@@ -326,44 +329,108 @@ async def start_server(interaction: discord.Interaction, container_id: str):
                 description="You don't have any instances!",  
                 color=EMBED_COLOR  
             )  
-            await interaction.response.send_message(embed=embed)  
+            await interaction.response.send_message(embed=embed, ephemeral=True)  
             return
 
+        # Search database for this user's container
         with open(database_file, 'r') as f:
             for line in f:
-                if user in line and container_id in line:
-                    container_info = line.strip()
+                parts = line.strip().split('|')
+                if len(parts) >= 3 and user == parts[0] and container_id in parts[1]:
+                    container_info = parts[1]
+                    ssh_command = parts[2]
                     break
 
         if not container_info:  
             embed = discord.Embed(  
                 title="🚫 Instance Not Found",  
-                description="No instance found with that ID!",  
+                description="No instance found with that ID that belongs to you!",  
                 color=EMBED_COLOR  
             )  
-            await interaction.response.send_message(embed=embed)  
+            await interaction.response.send_message(embed=embed, ephemeral=True)  
             return  
 
         try:  
-            subprocess.run(["docker", "start", container_id], check=True)  
-            embed = discord.Embed(  
-                title="🟢 Instance Started",  
-                description=f"Instance `{container_id[:12]}` has been started!",
-                color=EMBED_COLOR  
-            )  
+            # First check if container exists
+            check_cmd = subprocess.run(["docker", "inspect", "--format='{{.State.Status}}'", container_info], 
+                                     capture_output=True, text=True)
+            
+            if check_cmd.returncode != 0:
+                embed = discord.Embed(  
+                    title="❌ Container Not Found",  
+                    description=f"Container `{container_info[:12]}` doesn't exist in Docker!",
+                    color=EMBED_COLOR  
+                )  
+                await interaction.response.send_message(embed=embed, ephemeral=True)
+                # Remove from database since it doesn't exist
+                remove_from_database(ssh_command)
+                return
+            
+            # Start the container
+            subprocess.run(["docker", "start", container_info], check=True)
+            
+            # Get new SSH connection details (since tmate session changes)
+            try:
+                exec_cmd = await asyncio.create_subprocess_exec(
+                    "docker", "exec", container_info, "tmate", "-F",
+                    stdout=asyncio.subprocess.PIPE, 
+                    stderr=asyncio.subprocess.PIPE
+                )  
+                ssh_session_line = await capture_ssh_session_line(exec_cmd)
+                
+                if ssh_session_line:
+                    # Update database with new SSH command
+                    remove_from_database(ssh_command)
+                    add_to_database(user, container_info, ssh_session_line)
+                    
+                    # Send DM with new connection details
+                    try:
+                        dm_embed = discord.Embed(  
+                            title="🟢 Instance Started",  
+                            description=f"**🔑 New SSH Command:**\n```{ssh_session_line}```",  
+                            color=EMBED_COLOR  
+                        )
+                        await interaction.user.send(embed=dm_embed)
+                    except discord.Forbidden:
+                        pass  # Can't send DM, we'll include in main response
+                    
+                    embed = discord.Embed(  
+                        title="🟢 Instance Started",  
+                        description=f"Instance `{container_info[:12]}` has been started!\n📩 Check your DMs for new connection details.",
+                        color=EMBED_COLOR  
+                    )  
+                else:
+                    embed = discord.Embed(  
+                        title="🟢 Instance Started",  
+                        description=f"Instance `{container_info[:12]}` has been started!\n⚠️ Could not get new SSH details.",
+                        color=EMBED_COLOR  
+                    )
+            except Exception as e:
+                print(f"Error getting new SSH session: {e}")
+                embed = discord.Embed(  
+                    title="🟢 Instance Started",  
+                    description=f"Instance `{container_info[:12]}` has been started!\n⚠️ Could not refresh SSH details.",
+                    color=EMBED_COLOR  
+                )
+            
             await interaction.response.send_message(embed=embed)  
-            await send_to_logs(f"🟢 {interaction.user.mention} started instance `{container_id[:12]}`")
+            await send_to_logs(f"🟢 {interaction.user.mention} started instance `{container_info[:12]}`")
+            
         except subprocess.CalledProcessError as e:  
             embed = discord.Embed(  
-                title="❌ Error",  
-                description=f"Error starting instance:\n```{e}```",  
+                title="❌ Error Starting Instance",  
+                description=f"```{e.stderr if e.stderr else e.stdout}```",  
                 color=EMBED_COLOR  
             )  
-            await interaction.response.send_message(embed=embed)
+            await interaction.response.send_message(embed=embed, ephemeral=True)
+            
     except Exception as e:
         print(f"Error in start_server: {e}")
         try:
-            await interaction.response.send_message("❌ An error occurred while processing your request.", ephemeral=True)
+            await interaction.response.send_message(
+                "❌ An error occurred while processing your request.", 
+                ephemeral=True
+            )
         except:
             pass
 
@@ -380,44 +447,67 @@ async def stop_server(interaction: discord.Interaction, container_id: str):
                 description="You don't have any instances!",  
                 color=EMBED_COLOR  
             )  
-            await interaction.response.send_message(embed=embed)  
+            await interaction.response.send_message(embed=embed, ephemeral=True)  
             return
 
         with open(database_file, 'r') as f:
             for line in f:
-                if user in line and container_id in line:
-                    container_info = line.strip()
+                parts = line.strip().split('|')
+                if len(parts) >= 3 and user == parts[0] and container_id in parts[1]:
+                    container_info = parts[1]
                     break
 
         if not container_info:  
             embed = discord.Embed(  
                 title="🚫 Instance Not Found",  
-                description="No instance found with that ID!",  
+                description="No instance found with that ID that belongs to you!",  
                 color=EMBED_COLOR  
             )  
-            await interaction.response.send_message(embed=embed)  
+            await interaction.response.send_message(embed=embed, ephemeral=True)  
             return  
 
         try:  
-            subprocess.run(["docker", "stop", container_id], check=True)  
+            # First check if container exists
+            check_cmd = subprocess.run(["docker", "inspect", container_info], 
+                                     capture_output=True, text=True)
+            
+            if check_cmd.returncode != 0:
+                embed = discord.Embed(  
+                    title="❌ Container Not Found",  
+                    description=f"Container `{container_info[:12]}` doesn't exist in Docker!",
+                    color=EMBED_COLOR  
+                )  
+                await interaction.response.send_message(embed=embed, ephemeral=True)
+                # Remove from database since it doesn't exist
+                remove_from_database(container_info)
+                return
+            
+            # Stop the container
+            subprocess.run(["docker", "stop", container_info], check=True)
+            
             embed = discord.Embed(  
                 title="🛑 Instance Stopped",  
-                description=f"Instance `{container_id[:12]}` has been stopped!",
+                description=f"Instance `{container_info[:12]}` has been stopped!",
                 color=EMBED_COLOR  
             )  
             await interaction.response.send_message(embed=embed)  
-            await send_to_logs(f"🛑 {interaction.user.mention} stopped instance `{container_id[:12]}`")
+            await send_to_logs(f"🛑 {interaction.user.mention} stopped instance `{container_info[:12]}`")
+            
         except subprocess.CalledProcessError as e:  
             embed = discord.Embed(  
-                title="❌ Error",  
-                description=f"Error stopping instance:\n```{e}```",  
+                title="❌ Error Stopping Instance",  
+                description=f"```{e.stderr if e.stderr else e.stdout}```",  
                 color=EMBED_COLOR  
             )  
-            await interaction.response.send_message(embed=embed)
+            await interaction.response.send_message(embed=embed, ephemeral=True)
+            
     except Exception as e:
         print(f"Error in stop_server: {e}")
         try:
-            await interaction.response.send_message("❌ An error occurred while processing your request.", ephemeral=True)
+            await interaction.response.send_message(
+                "❌ An error occurred while processing your request.", 
+                ephemeral=True
+            )
         except:
             pass
 
@@ -427,6 +517,7 @@ async def restart_server(interaction: discord.Interaction, container_id: str):
     try:
         user = str(interaction.user)
         container_info = None
+        ssh_command = None
         
         if not os.path.exists(database_file):
             embed = discord.Embed(  
@@ -434,44 +525,107 @@ async def restart_server(interaction: discord.Interaction, container_id: str):
                 description="You don't have any instances!",  
                 color=EMBED_COLOR  
             )  
-            await interaction.response.send_message(embed=embed)  
+            await interaction.response.send_message(embed=embed, ephemeral=True)  
             return
 
         with open(database_file, 'r') as f:
             for line in f:
-                if user in line and container_id in line:
-                    container_info = line.strip()
+                parts = line.strip().split('|')
+                if len(parts) >= 3 and user == parts[0] and container_id in parts[1]:
+                    container_info = parts[1]
+                    ssh_command = parts[2]
                     break
 
         if not container_info:  
             embed = discord.Embed(  
                 title="🚫 Instance Not Found",  
-                description="No instance found with that ID!",  
+                description="No instance found with that ID that belongs to you!",  
                 color=EMBED_COLOR  
             )  
-            await interaction.response.send_message(embed=embed)  
+            await interaction.response.send_message(embed=embed, ephemeral=True)  
             return  
 
         try:  
-            subprocess.run(["docker", "restart", container_id], check=True)  
-            embed = discord.Embed(  
-                title="🔄 Instance Restarted",  
-                description=f"Instance `{container_id[:12]}` has been restarted!",
-                color=EMBED_COLOR  
-            )  
+            # First check if container exists
+            check_cmd = subprocess.run(["docker", "inspect", container_info], 
+                                     capture_output=True, text=True)
+            
+            if check_cmd.returncode != 0:
+                embed = discord.Embed(  
+                    title="❌ Container Not Found",  
+                    description=f"Container `{container_info[:12]}` doesn't exist in Docker!",
+                    color=EMBED_COLOR  
+                )  
+                await interaction.response.send_message(embed=embed, ephemeral=True)
+                # Remove from database since it doesn't exist
+                remove_from_database(ssh_command)
+                return
+            
+            # Restart the container
+            subprocess.run(["docker", "restart", container_info], check=True)
+            
+            # Get new SSH connection details (since tmate session changes)
+            try:
+                exec_cmd = await asyncio.create_subprocess_exec(
+                    "docker", "exec", container_info, "tmate", "-F",
+                    stdout=asyncio.subprocess.PIPE, 
+                    stderr=asyncio.subprocess.PIPE
+                )  
+                ssh_session_line = await capture_ssh_session_line(exec_cmd)
+                
+                if ssh_session_line:
+                    # Update database with new SSH command
+                    remove_from_database(ssh_command)
+                    add_to_database(user, container_info, ssh_session_line)
+                    
+                    # Send DM with new connection details
+                    try:
+                        dm_embed = discord.Embed(  
+                            title="🔄 Instance Restarted",  
+                            description=f"**🔑 New SSH Command:**\n```{ssh_session_line}```",  
+                            color=EMBED_COLOR  
+                        )
+                        await interaction.user.send(embed=dm_embed)
+                    except discord.Forbidden:
+                        pass  # Can't send DM, we'll include in main response
+                    
+                    embed = discord.Embed(  
+                        title="🔄 Instance Restarted",  
+                        description=f"Instance `{container_info[:12]}` has been restarted!\n📩 Check your DMs for new connection details.",
+                        color=EMBED_COLOR  
+                    )  
+                else:
+                    embed = discord.Embed(  
+                        title="🔄 Instance Restarted",  
+                        description=f"Instance `{container_info[:12]}` has been restarted!\n⚠️ Could not get new SSH details.",
+                        color=EMBED_COLOR  
+                    )
+            except Exception as e:
+                print(f"Error getting new SSH session: {e}")
+                embed = discord.Embed(  
+                    title="🔄 Instance Restarted",  
+                    description=f"Instance `{container_info[:12]}` has been restarted!\n⚠️ Could not refresh SSH details.",
+                    color=EMBED_COLOR  
+                )
+            
             await interaction.response.send_message(embed=embed)  
-            await send_to_logs(f"🔄 {interaction.user.mention} restarted instance `{container_id[:12]}`")
+            await send_to_logs(f"🔄 {interaction.user.mention} restarted instance `{container_info[:12]}`")
+            
         except subprocess.CalledProcessError as e:  
             embed = discord.Embed(  
-                title="❌ Error",  
-                description=f"Error restarting instance:\n```{e}```",  
+                title="❌ Error Restarting Instance",  
+                description=f"```{e.stderr if e.stderr else e.stdout}```",  
                 color=EMBED_COLOR  
             )  
-            await interaction.response.send_message(embed=embed)
+            await interaction.response.send_message(embed=embed, ephemeral=True)
+            
     except Exception as e:
         print(f"Error in restart_server: {e}")
         try:
-            await interaction.response.send_message("❌ An error occurred while processing your request.", ephemeral=True)
+            await interaction.response.send_message(
+                "❌ An error occurred while processing your request.", 
+                ephemeral=True
+            )
         except:
             pass
 
@@ -481,6 +635,7 @@ async def remove_server(interaction: discord.Interaction, container_id: str):
     try:
         user = str(interaction.user)
         container_info = None
+        ssh_command = None
         
         if not os.path.exists(database_file):
             embed = discord.Embed(  
@@ -488,47 +643,72 @@ async def remove_server(interaction: discord.Interaction, container_id: str):
                 description="You don't have any instances!",  
                 color=EMBED_COLOR  
             )  
-            await interaction.response.send_message(embed=embed)  
+            await interaction.response.send_message(embed=embed, ephemeral=True)  
             return
 
         with open(database_file, 'r') as f:
             for line in f:
-                if user in line and container_id in line:
-                    container_info = line.strip()
+                parts = line.strip().split('|')
+                if len(parts) >= 3 and user == parts[0] and container_id in parts[1]:
+                    container_info = parts[1]
+                    ssh_command = parts[2]
                     break
 
         if not container_info:  
             embed = discord.Embed(  
                 title="🚫 Instance Not Found",  
-                description="No instance found with that ID!",  
+                description="No instance found with that ID that belongs to you!",  
                 color=EMBED_COLOR  
             )  
-            await interaction.response.send_message(embed=embed)  
+            await interaction.response.send_message(embed=embed, ephemeral=True)  
             return  
 
         try:  
-            subprocess.run(["docker", "stop", container_id], check=True)  
-            subprocess.run(["docker", "rm", container_id], check=True)  
-            remove_from_database(container_id)
+            # First check if container exists
+            check_cmd = subprocess.run(["docker", "inspect", container_info], 
+                                     capture_output=True, text=True)
+            
+            if check_cmd.returncode != 0:
+                embed = discord.Embed(  
+                    title="❌ Container Not Found",  
+                    description=f"Container `{container_info[:12]}` doesn't exist in Docker!",
+                    color=EMBED_COLOR  
+                )  
+                await interaction.response.send_message(embed=embed, ephemeral=True)
+                # Remove from database since it doesn't exist
+                remove_from_database(ssh_command)
+                return
+            
+            # Stop and remove the container
+            subprocess.run(["docker", "stop", container_info], check=True)  
+            subprocess.run(["docker", "rm", container_info], check=True)  
+            
+            # Remove from database
+            remove_from_database(ssh_command)
             
             embed = discord.Embed(  
                 title="🗑️ Instance Removed",  
-                description=f"Instance `{container_id[:12]}` has been permanently deleted!",
+                description=f"Instance `{container_info[:12]}` has been permanently deleted!",
                 color=EMBED_COLOR  
             )  
             await interaction.response.send_message(embed=embed)  
-            await send_to_logs(f"❌ {interaction.user.mention} deleted instance `{container_id[:12]}`")
+            await send_to_logs(f"❌ {interaction.user.mention} deleted instance `{container_info[:12]}`")
+            
         except subprocess.CalledProcessError as e:  
             embed = discord.Embed(  
-                title="❌ Error",  
-                description=f"Error removing instance:\n```{e}```",  
+                title="❌ Error Removing Instance",  
+                description=f"```{e.stderr if e.stderr else e.stdout}```",  
                 color=EMBED_COLOR  
             )  
-            await interaction.response.send_message(embed=embed)
+            await interaction.response.send_message(embed=embed, ephemeral=True)
+            
     except Exception as e:
         print(f"Error in remove_server: {e}")
         try:
-            await interaction.response.send_message("❌ An error occurred while processing your request.", ephemeral=True)
+            await interaction.response.send_message(
+                "❌ An error occurred while processing your request.", 
+                ephemeral=True
+            )
         except:
             pass
 
@@ -553,8 +733,14 @@ async def list_servers(interaction: discord.Interaction):
         )
         
         for server in servers:
-            _, container_id, ssh_cmd = server.split('|')
+            parts = server.split('|')
+            if len(parts) < 3:
+                continue
+                
+            container_id = parts[1]
+            ssh_cmd = parts[2]
             os_type = "Unknown"
+            
             for os_id, os_data in OS_OPTIONS.items():
                 if os_id in ssh_cmd.lower():
                     os_type = f"{os_data['emoji']} {os_data['name']}"
